@@ -94,7 +94,9 @@ function AttachmentPreview({
         >
           <File size={16} className="text-muted-foreground" />
           <div className="flex flex-col min-w-0">
-            <span className="text-sm truncate max-w-[150px]">{attachment.file_name}</span>
+            <span className="text-sm truncate max-w-[150px]">
+              {attachment.file_name}
+            </span>
             <span className="text-xs text-muted-foreground">
               {formatFileSize(Number(attachment.file_size))}
             </span>
@@ -148,8 +150,8 @@ function ChatMessage({
         isUser
           ? 'bg-primary/10 ml-4'
           : isSystem
-          ? 'bg-muted/50 border border-dashed'
-          : 'bg-muted/30 mr-4'
+            ? 'bg-muted/50 border border-dashed'
+            : 'bg-muted/30 mr-4'
       )}
     >
       <div className="flex items-center justify-between gap-2">
@@ -211,13 +213,14 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const dropZoneRef = useRef<HTMLDivElement>(null);
   const queryClient = useQueryClient();
-  const { settings: autoReviewSettings, updateSettings } = useAutoReviewSettings(projectId);
+  const { settings: autoReviewSettings, updateSettings } =
+    useAutoReviewSettings(projectId);
 
-  // Available AI models
+  // Available AI models (Claude CLI models)
   const aiModels = [
-    { value: 'sonnet', label: 'Claude Sonnet' },
-    { value: 'opus', label: 'Claude Opus' },
-    { value: 'haiku', label: 'Claude Haiku' },
+    { value: 'sonnet', label: 'Sonnet' },
+    { value: 'opus', label: 'Opus' },
+    { value: 'haiku', label: 'Haiku' },
   ];
 
   const {
@@ -248,7 +251,9 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     mutationFn: () => pmChatApi.clearChat(projectId!),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['pm-chat', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['pm-chat-attachments', projectId] });
+      queryClient.invalidateQueries({
+        queryKey: ['pm-chat-attachments', projectId],
+      });
       setShowClearDialog(false);
     },
   });
@@ -257,7 +262,9 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     mutationFn: (file: File) => pmChatApi.uploadAttachment(projectId!, file),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: ['pm-chat', projectId] });
-      queryClient.invalidateQueries({ queryKey: ['pm-chat-attachments', projectId] });
+      queryClient.invalidateQueries({
+        queryKey: ['pm-chat-attachments', projectId],
+      });
     },
   });
 
@@ -265,7 +272,9 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     mutationFn: (attachmentId: string) =>
       pmChatApi.deleteAttachment(projectId!, attachmentId),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ['pm-chat-attachments', projectId] });
+      queryClient.invalidateQueries({
+        queryKey: ['pm-chat-attachments', projectId],
+      });
     },
   });
 
@@ -294,7 +303,7 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     });
   };
 
-  const handleSendMessage = () => {
+  const handleSendMessage = async () => {
     if (!messageInput.trim() || !projectId || isAiResponding) return;
 
     const content = messageInput.trim();
@@ -302,6 +311,18 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     setIsAiResponding(true);
     setStreamingResponse('');
 
+    // First, send the user message and show it immediately
+    try {
+      await pmChatApi.sendMessage(projectId, { content, role: 'user' });
+      // Refresh to show the user message right away
+      await queryClient.invalidateQueries({ queryKey: ['pm-chat', projectId] });
+    } catch (error) {
+      console.error('Failed to send user message:', error);
+      setIsAiResponding(false);
+      return;
+    }
+
+    // Then start the AI response stream
     abortControllerRef.current = pmChatApi.aiChat(
       projectId,
       content,
@@ -321,7 +342,7 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
         setIsAiResponding(false);
         setStreamingResponse('');
         console.error('AI chat error:', error);
-        // Invalidate to show the user message at least
+        // Invalidate to show the assistant error or partial response
         queryClient.invalidateQueries({ queryKey: ['pm-chat', projectId] });
       }
     );
@@ -357,7 +378,9 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
         } catch (error) {
           console.error('Failed to upload file:', file.name, error);
         } finally {
-          setUploadingFiles((prev) => prev.filter((name) => name !== file.name));
+          setUploadingFiles((prev) =>
+            prev.filter((name) => name !== file.name)
+          );
         }
       }
     },
@@ -374,7 +397,10 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
     e.preventDefault();
     e.stopPropagation();
     // Only set dragging to false if we're leaving the drop zone entirely
-    if (dropZoneRef.current && !dropZoneRef.current.contains(e.relatedTarget as Node)) {
+    if (
+      dropZoneRef.current &&
+      !dropZoneRef.current.contains(e.relatedTarget as Node)
+    ) {
       setIsDragging(false);
     }
   }, []);
@@ -444,7 +470,10 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                     </DialogDescription>
                   </DialogHeader>
                   <DialogFooter>
-                    <Button variant="outline" onClick={() => setShowClearDialog(false)}>
+                    <Button
+                      variant="outline"
+                      onClick={() => setShowClearDialog(false)}
+                    >
                       {t('common:actions.cancel')}
                     </Button>
                     <Button
@@ -476,7 +505,10 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom">
-                    {t('tasks:autoReviewSettings.title', 'Auto-Review Settings')}
+                    {t(
+                      'tasks:autoReviewSettings.title',
+                      'Auto-Review Settings'
+                    )}
                     {autoReviewSettings.enabled && (
                       <span className="ml-1 text-primary">(ON)</span>
                     )}
@@ -503,7 +535,10 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                     </Button>
                   </TooltipTrigger>
                   <TooltipContent side="bottom">
-                    {t('tasks:pmDocs.syncTasks', 'Sync tasks & dependencies to docs')}
+                    {t(
+                      'tasks:pmDocs.syncTasks',
+                      'Sync tasks & dependencies to docs'
+                    )}
                   </TooltipContent>
                 </Tooltip>
               </TooltipProvider>
@@ -515,7 +550,11 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
             onClick={toggleExpanded}
             className={cn('h-6 w-6 p-0', !isExpanded && 'mx-auto')}
           >
-            {isExpanded ? <ChevronLeft size={16} /> : <ChevronRight size={16} />}
+            {isExpanded ? (
+              <ChevronLeft size={16} />
+            ) : (
+              <ChevronRight size={16} />
+            )}
           </Button>
         </div>
       </div>
@@ -609,7 +648,9 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                             message={message}
                             attachments={attachments}
                             projectId={projectId}
-                            onDelete={() => deleteMessageMutation.mutate(message.id)}
+                            onDelete={() =>
+                              deleteMessageMutation.mutate(message.id)
+                            }
                             onDeleteAttachment={(attachmentId) =>
                               deleteAttachmentMutation.mutate(attachmentId)
                             }
@@ -623,15 +664,25 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                                 <Bot size={12} />
                                 {t('tasks:pmDocs.assistant', 'Assistant')}
                               </span>
-                              <Loader2 size={12} className="animate-spin text-muted-foreground" />
+                              <Loader2
+                                size={12}
+                                className="animate-spin text-muted-foreground"
+                              />
                             </div>
-                            <div className="whitespace-pre-wrap break-words">{streamingResponse}</div>
+                            <div className="whitespace-pre-wrap break-words">
+                              {streamingResponse}
+                            </div>
                           </div>
                         )}
                         {isAiResponding && !streamingResponse && (
                           <div className="flex items-center gap-2 p-2 text-sm text-muted-foreground">
                             <Loader2 size={14} className="animate-spin" />
-                            <span>{t('tasks:pmDocs.aiThinking', 'AI is thinking...')}</span>
+                            <span>
+                              {t(
+                                'tasks:pmDocs.aiThinking',
+                                'AI is thinking...'
+                              )}
+                            </span>
                           </div>
                         )}
                       </>
@@ -645,7 +696,8 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                       <div className="flex items-center gap-2 text-xs text-muted-foreground">
                         <Loader2 size={12} className="animate-spin" />
                         <span>
-                          {t('tasks:pmDocs.uploading', 'Uploading')} {uploadingFiles.join(', ')}...
+                          {t('tasks:pmDocs.uploading', 'Uploading')}{' '}
+                          {uploadingFiles.join(', ')}...
                         </span>
                       </div>
                     </div>
@@ -682,9 +734,14 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                                   size="sm"
                                   onClick={handleAttachClick}
                                   className="h-6 w-6 p-0"
-                                  disabled={uploadingFiles.length > 0 || isAiResponding}
+                                  disabled={
+                                    uploadingFiles.length > 0 || isAiResponding
+                                  }
                                 >
-                                  <Paperclip size={14} className="text-muted-foreground" />
+                                  <Paperclip
+                                    size={14}
+                                    className="text-muted-foreground"
+                                  />
                                 </Button>
                               </TooltipTrigger>
                               <TooltipContent side="top">
@@ -703,7 +760,11 @@ export function PmDocsPanel({ projectId, className }: PmDocsPanelProps) {
                             </SelectTrigger>
                             <SelectContent>
                               {aiModels.map((model) => (
-                                <SelectItem key={model.value} value={model.value} className="text-xs">
+                                <SelectItem
+                                  key={model.value}
+                                  value={model.value}
+                                  className="text-xs"
+                                >
                                   {model.label}
                                 </SelectItem>
                               ))}
