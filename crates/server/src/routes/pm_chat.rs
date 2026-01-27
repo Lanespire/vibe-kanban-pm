@@ -1,4 +1,4 @@
-use std::{fs, path::PathBuf, process::Stdio};
+use std::{env, fs, path::PathBuf, process::Stdio, sync::Arc};
 
 use axum::{
     Extension, Json, Router,
@@ -7,7 +7,7 @@ use axum::{
     http::{StatusCode, header},
     response::{
         Json as ResponseJson, Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, KeepAlive, KeepAliveStream, Sse},
     },
     routing::{delete, get, post},
 };
@@ -19,20 +19,102 @@ use db::models::{
     },
     project::Project,
     project_repo::ProjectRepo,
-    repo::Repo,
     task::Task,
 };
 use deployment::Deployment;
-use futures::stream::Stream;
+use futures::stream::BoxStream;
+use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
+use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::{fs::File, process::Command};
+use strum_macros::{Display, EnumString};
+use tokio::{
+    fs::File,
+    io::{AsyncBufReadExt, BufReader},
+    process::Command,
+    sync::Mutex,
+};
 use tokio_util::io::ReaderStream;
 use ts_rs::TS;
 use utils::{response::ApiResponse, shell::resolve_executable_path};
 use uuid::Uuid;
 
 use crate::{DeploymentImpl, error::ApiError};
+
+/// Available AI CLI providers for PM Chat
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, TS, Display, EnumString, Default)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+#[strum(serialize_all = "SCREAMING_SNAKE_CASE")]
+#[ts(export)]
+pub enum PmChatAgent {
+    /// Claude CLI (claude) - Anthropic's coding assistant
+    #[default]
+    ClaudeCli,
+    /// Codex CLI (codex) - OpenAI's coding assistant
+    CodexCli,
+    /// Gemini CLI (gemini) - Google's coding assistant
+    GeminiCli,
+    /// OpenCode CLI (opencode) - Open source coding assistant
+    OpencodeCli,
+}
+
+impl PmChatAgent {
+    /// Get the command name for this CLI
+    pub fn command_name(&self) -> &'static str {
+        match self {
+            PmChatAgent::ClaudeCli => "claude",
+            PmChatAgent::CodexCli => "codex",
+            PmChatAgent::GeminiCli => "gemini",
+            PmChatAgent::OpencodeCli => "opencode",
+        }
+    }
+
+    /// Get display name for UI
+    pub fn display_name(&self) -> &'static str {
+        match self {
+            PmChatAgent::ClaudeCli => "Claude CLI",
+            PmChatAgent::CodexCli => "Codex CLI",
+            PmChatAgent::GeminiCli => "Gemini CLI",
+            PmChatAgent::OpencodeCli => "OpenCode CLI",
+        }
+    }
+
+    /// Check if this CLI supports streaming output
+    pub fn supports_streaming(&self) -> bool {
+        match self {
+            PmChatAgent::ClaudeCli => true,
+            PmChatAgent::CodexCli => true,
+            PmChatAgent::GeminiCli => true, // Gemini CLI supports --output-format stream-json
+            PmChatAgent::OpencodeCli => true,
+        }
+    }
+
+    /// Check if this CLI is available (installed)
+    pub async fn is_available(&self) -> bool {
+        resolve_executable_path(self.command_name()).await.is_some()
+    }
+
+    /// Get all available CLI agents on this system
+    pub async fn available_agents() -> Vec<PmChatAgent> {
+        let all_agents = vec![
+            PmChatAgent::ClaudeCli,
+            PmChatAgent::CodexCli,
+            PmChatAgent::GeminiCli,
+            PmChatAgent::OpencodeCli,
+        ];
+
+        let mut available = Vec::new();
+        for agent in all_agents {
+            if agent.is_available().await {
+                available.push(agent);
+            }
+        }
+        available
+    }
+}
+
+/// Type alias for boxed SSE stream to unify different stream implementations
+type SseStream = KeepAliveStream<BoxStream<'static, Result<Event, std::convert::Infallible>>>;
 
 /// Request payload for sending a chat message
 #[derive(Debug, Clone, Deserialize, TS)]
@@ -43,18 +125,41 @@ pub struct SendMessageRequest {
 
 /// Request payload for AI-assisted chat
 #[derive(Debug, Clone, Deserialize, TS)]
+#[ts(export)]
 pub struct AiChatRequest {
     pub content: String,
     pub model: Option<String>, // e.g., "sonnet", "opus", "haiku"
+    pub agent: Option<PmChatAgent>, // CLI agent to use (defaults to ClaudeCli)
+}
+
+/// Response for available PM Chat agents
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct AvailablePmChatAgentsResponse {
+    pub agents: Vec<PmChatAgentInfo>,
+}
+
+/// Information about a PM Chat agent
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct PmChatAgentInfo {
+    pub agent: PmChatAgent,
+    pub display_name: String,
+    pub available: bool,
+    pub supports_streaming: bool,
 }
 
 /// SSE event data for streaming AI response
 #[derive(Debug, Clone, Serialize)]
 pub struct AiChatStreamEvent {
     #[serde(rename = "type")]
-    pub event_type: String, // "content", "done", "error"
+    pub event_type: String, // "content", "done", "error", "tool_use", "task_created", "docs_updated"
     pub content: Option<String>,
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub task_title: Option<String>,
 }
 
 /// Response for PM chat with messages and attachments
@@ -118,293 +223,719 @@ pub async fn send_message(
     Ok(ResponseJson(ApiResponse::success(message)))
 }
 
-/// Send a message and get an AI response using Claude CLI
-/// Note: The user message should be sent via send_message() first, then call this endpoint
+/// Send a message and get an AI response using Claude CLI with MCP tools
 pub async fn ai_chat(
     Extension(project): Extension<Project>,
     State(deployment): State<DeploymentImpl>,
     Json(payload): Json<AiChatRequest>,
-) -> Result<Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>>, ApiError> {
-    // Get conversation history for context (user message should already be saved)
+) -> Result<Sse<SseStream>, ApiError> {
+    // Get conversation history for context
     let messages = PmConversation::find_by_project_id(&deployment.db().pool, project.id).await?;
 
-    // Build conversation context
-    let mut conversation_context = String::new();
-    for msg in messages.iter().rev().take(20).rev() {
-        let role = match msg.role.as_str() {
-            "user" => "User",
-            "assistant" => "Assistant",
-            "system" => "System",
-            _ => "User",
-        };
-        conversation_context.push_str(&format!("{}: {}\n\n", role, msg.content));
-    }
+    // Get project labels for AI context
+    let labels = db::models::label::Label::find_by_project_id(&deployment.db().pool, project.id)
+        .await
+        .unwrap_or_default();
 
     // Build system prompt with PM context
-    let mut system_prompt = String::from(
-        "You are a helpful Project Manager assistant. You help with project planning, task management, and technical discussions.\n\n",
+    let mut system_prompt = format!(
+        r#"You are an expert Project Manager assistant for a Kanban-style project management app.
+
+## IMPORTANT: Project Context
+You are working on project_id: {}
+
+## Your MCP Tools
+You have access to vibe_kanban MCP tools for comprehensive project management:
+
+### Task Management
+- **create_task**: Create a task with ALL these parameters:
+  - `project_id`: Required - the project ID
+  - `title`: Clear, actionable title
+  - `description`: DETAILED description including:
+    - What needs to be done (具体的な作業内容)
+    - Acceptance criteria (完了条件)
+    - Technical approach if applicable (技術的なアプローチ)
+  - `priority`: REQUIRED - 'urgent', 'high', 'medium', or 'low'
+  - `depends_on`: List of task IDs this depends on
+  - `label_ids`: List of matching label IDs
+  - `check_duplicate: true` to avoid duplicates
+- **get_project_progress**: Get completion percentage and status summary for project_id
+- **list_tasks**: List all tasks in the project
+- **update_task**: Update task status, title, description
+- **get_task**: Get detailed task information
+
+### Documentation
+- **update_pm_docs**: Update project documentation
+  - Use `mode: "append"` to add to existing docs
+  - Use `mode: "replace"` to replace all docs
+  - Structure docs with markdown sections: ## 仕様, ## 設計, ## メモ, etc.
+
+### PM Context
+- **get_pm_context**: Get PM specifications and guidelines
+- **request_pm_review**: Generate review checklist based on PM specs
+
+## When to Use Tools
+- Before creating a task → use list_tasks to understand existing tasks and their dependencies
+- When creating a task → ALWAYS use check_duplicate=true to prevent duplicates
+- When creating tasks → analyze dependencies: which tasks need to be completed first?
+- When creating tasks → match labels based on task type (bug, feature, design, etc.)
+- When saving documentation → organize with clear markdown sections
+
+## Dependency Analysis Guidelines
+When the user wants to create multiple tasks or a task that relates to existing tasks:
+1. First call list_tasks to see all existing tasks
+2. Analyze which tasks logically depend on others (e.g., "implement API" before "create frontend")
+3. When creating each task, set the depends_on parameter with the IDs of prerequisite tasks
+4. Consider common dependency patterns:
+   - Design → Implementation → Testing
+   - Backend API → Frontend integration
+   - Database schema → Data access layer → Business logic
+   - Setup/Config → Feature development
+
+## Label Assignment Guidelines
+When creating a task, analyze its title and description to match appropriate labels.
+"#,
+        project.id
     );
+
+    // Add available labels to the prompt
+    if !labels.is_empty() {
+        system_prompt.push_str("\n## Available Labels for This Project\n");
+        for label in &labels {
+            let executor_info = label.executor.as_ref()
+                .map(|e| format!(" (executor: {})", e))
+                .unwrap_or_default();
+            system_prompt.push_str(&format!(
+                "- **{}** (id: {}){}\n",
+                label.name, label.id, executor_info
+            ));
+        }
+        system_prompt.push_str("\nWhen creating tasks, match labels based on:\n");
+        system_prompt.push_str("- Task type keywords (bug, fix → bug label; feature, add → feature label)\n");
+        system_prompt.push_str("- Task domain (UI, frontend → frontend label; API, backend → backend label)\n");
+        system_prompt.push_str("- If executor is specified for a label, consider using it for matching task types\n\n");
+    }
+
+    system_prompt.push_str(&format!(
+        r#"## MANDATORY Rules for Task Creation
+When creating ANY task, you MUST:
+1. **priority**: ALWAYS set priority (urgent/high/medium/low) - analyze task importance
+2. **description**: ALWAYS write detailed description with:
+   - 作業内容: What needs to be done in detail
+   - 完了条件: Clear acceptance criteria
+   - 備考: Any technical notes or approach
+3. **label_ids**: ALWAYS check available labels and attach matching ones
+4. **depends_on**: ALWAYS analyze existing tasks and set dependencies if any
+
+## Guidelines
+- ALWAYS use project_id={} when calling tools
+- ALWAYS use check_duplicate=true when creating tasks
+- Before creating tasks, call list_tasks to analyze dependencies
+- Match labels by keywords: bug/fix→bug, feature/add→feature, UI/画面→frontend
+- Structure documentation with sections: 仕様, 設計, 議事録, etc.
+- Report progress status when asked
+- Use Japanese when the user writes in Japanese
+
+"#,
+        project.id
+    ));
 
     // Add PM docs if available
     if let Some(ref docs) = project.pm_docs {
-        system_prompt.push_str("## Project Documentation\n");
+        system_prompt.push_str("## Current Project Documentation\n```\n");
         system_prompt.push_str(docs);
-        system_prompt.push_str("\n\n");
+        system_prompt.push_str("\n```\n\n");
     }
 
-    // Get task summary
+    // Get task summary with IDs, labels, and dependencies
     let tasks_with_status =
         Task::find_by_project_id_with_attempt_status(&deployment.db().pool, project.id)
             .await
             .unwrap_or_default();
 
     if !tasks_with_status.is_empty() {
-        system_prompt.push_str("## Current Tasks\n");
+        system_prompt.push_str("## Current Tasks (use these IDs for depends_on)\n");
         for task_with_status in &tasks_with_status {
             let task = &task_with_status.task;
-            system_prompt.push_str(&format!(
-                "- [{:?}] {} (Priority: {:?})\n",
-                task.status, task.title, task.priority
-            ));
+
+            // Get task labels
+            let task_labels = db::models::label::Label::find_by_task_id(&deployment.db().pool, task.id)
+                .await
+                .unwrap_or_default();
+            let label_names: Vec<String> = task_labels.iter()
+                .map(|l| l.name.clone())
+                .collect();
+
+            // Get task dependencies
+            let deps = TaskDependency::find_dependencies(&deployment.db().pool, task.id)
+                .await
+                .unwrap_or_default();
+
+            // Format: - [status] title (id: xxx, priority: P, labels: [L1, L2], depends_on: [id1, id2])
+            let mut task_info = format!(
+                "- [{:?}] {} (id: {}, priority: {:?}",
+                task.status, task.title, task.id, task.priority
+            );
+
+            if !label_names.is_empty() {
+                task_info.push_str(&format!(", labels: [{}]", label_names.join(", ")));
+            }
+
+            if !deps.is_empty() {
+                let dep_ids: Vec<String> = deps.iter().map(|id| id.to_string()).collect();
+                task_info.push_str(&format!(", depends_on: [{}]", dep_ids.join(", ")));
+            }
+
+            task_info.push_str(")\n");
+            system_prompt.push_str(&task_info);
         }
         system_prompt.push('\n');
     }
 
-    system_prompt.push_str("## Conversation History\n");
-    system_prompt.push_str(&conversation_context);
-
-    // Prepare Claude CLI command - clone values for 'static lifetime
-    let model = payload
-        .model
-        .clone()
-        .unwrap_or_else(|| "sonnet".to_string());
-    let user_content = payload.content.clone();
-    let system_prompt_owned = system_prompt;
-
-    let pool = deployment.db().pool.clone();
-    let project_id = project.id;
-
-    // Get the project's workspace path from its repositories
-    // This is where Claude CLI should run to have proper codebase context
-    let workspace_path = {
-        let project_repos = ProjectRepo::find_by_project_id(&pool, project_id)
-            .await
-            .unwrap_or_default();
-        if let Some(first_project_repo) = project_repos.first() {
-            if let Ok(Some(repo)) = Repo::find_by_id(&pool, first_project_repo.repo_id).await {
-                Some(repo.path)
+    // Add recent conversation history for context (last 10 messages)
+    if !messages.is_empty() {
+        system_prompt.push_str("## Recent Conversation History\n");
+        let recent_messages: Vec<_> = messages.iter().rev().take(10).collect();
+        for msg in recent_messages.iter().rev() {
+            let role_str = match msg.role.as_str() {
+                "user" => "User",
+                "assistant" => "Assistant",
+                "system" => "System",
+                _ => "User",
+            };
+            // Truncate long messages to avoid context overflow (UTF-8 safe)
+            let content = if msg.content.len() > 500 {
+                let truncated = utils::text::truncate_to_char_boundary(&msg.content, 500);
+                format!("{}...", truncated)
             } else {
-                None
-            }
-        } else {
-            // Fall back to default_agent_working_dir if no repos
-            project.default_agent_working_dir.map(PathBuf::from)
+                msg.content.clone()
+            };
+            system_prompt.push_str(&format!("**{}**: {}\n\n", role_str, content));
         }
-    };
-
-    tracing::info!("PM Chat AI workspace path: {:?}", workspace_path);
-
-    // Run claude CLI - try global claude binary first, then fallback to npx
-    // Use simple --print mode without stream-json to avoid known bugs
-    // See: https://github.com/anthropics/claude-code/issues/1920, #8126, #3187
-    let claude_path_result = resolve_executable_path("claude").await;
-    let npx_path_result = resolve_executable_path("npx").await;
-
-    // Execute CLI and get response
-    let (response_text, error_text) = if let Some(claude_path) = claude_path_result {
-        // Use global claude binary (faster than npx)
-        tracing::info!(
-            "Running Claude CLI from global binary at: {:?}",
-            claude_path
-        );
-
-        // Use tokio timeout - increased to 3 minutes for Claude Code initialization
-        // --dangerously-skip-permissions is required to skip permission prompts in non-interactive mode
-        let mut command = Command::new(&claude_path);
-        command
-            .arg("--print")
-            .arg("--dangerously-skip-permissions")
-            .arg("--model")
-            .arg(&model)
-            .arg("--system-prompt")
-            .arg(&system_prompt_owned)
-            .arg(&user_content)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Set working directory to project workspace if available
-        if let Some(ref path) = workspace_path {
-            tracing::info!("Setting Claude CLI working directory to: {:?}", path);
-            command.current_dir(path);
-        }
-
-        let output_future = command.output();
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(180), output_future).await;
-
-        // Parse the output - with --print (no stream-json), output is plain text
-        match output {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                tracing::debug!("Claude CLI stdout length: {}", stdout.len());
-                if !stderr.is_empty() {
-                    tracing::warn!("Claude CLI stderr: {}", stderr);
-                }
-
-                if stdout.is_empty() {
-                    (
-                        None,
-                        Some(format!(
-                            "No response from Claude CLI. Exit code: {:?}. stderr: {}",
-                            output.status.code(),
-                            stderr
-                        )),
-                    )
-                } else {
-                    (Some(stdout), None)
-                }
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Failed to run Claude CLI: {}", e);
-                (
-                    None,
-                    Some(format!(
-                        "Failed to run Claude CLI: {}. Make sure Claude Code is installed.",
-                        e
-                    )),
-                )
-            }
-            Err(_) => {
-                tracing::error!("Claude CLI timed out after 180 seconds");
-                (
-                    None,
-                    Some("Claude CLI timed out after 180 seconds.".to_string()),
-                )
-            }
-        }
-    } else if let Some(npx_path) = npx_path_result {
-        // Fallback to npx if global claude not found
-        tracing::info!("Running Claude CLI with npx at: {:?}", npx_path);
-
-        let mut command = Command::new(&npx_path);
-        command
-            .arg("-y")
-            .arg("@anthropic-ai/claude-code@latest")
-            .arg("--print")
-            .arg("--dangerously-skip-permissions")
-            .arg("--model")
-            .arg(&model)
-            .arg("--system-prompt")
-            .arg(&system_prompt_owned)
-            .arg(&user_content)
-            .env("NPM_CONFIG_LOGLEVEL", "error")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-
-        // Set working directory to project workspace if available
-        if let Some(ref path) = workspace_path {
-            tracing::info!("Setting Claude CLI working directory to: {:?}", path);
-            command.current_dir(path);
-        }
-
-        let output_future = command.output();
-
-        let output = tokio::time::timeout(std::time::Duration::from_secs(180), output_future).await;
-
-        // Parse the output - with --print (no stream-json), output is plain text
-        match output {
-            Ok(Ok(output)) => {
-                let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                let stderr = String::from_utf8_lossy(&output.stderr);
-
-                tracing::debug!("Claude CLI stdout length: {}", stdout.len());
-                if !stderr.is_empty() {
-                    tracing::warn!("Claude CLI stderr: {}", stderr);
-                }
-
-                if stdout.is_empty() {
-                    (
-                        None,
-                        Some(format!(
-                            "No response from Claude CLI. Exit code: {:?}. stderr: {}",
-                            output.status.code(),
-                            stderr
-                        )),
-                    )
-                } else {
-                    (Some(stdout), None)
-                }
-            }
-            Ok(Err(e)) => {
-                tracing::error!("Failed to run Claude CLI: {}", e);
-                (
-                    None,
-                    Some(format!(
-                        "Failed to run Claude CLI: {}. Make sure Claude Code is installed.",
-                        e
-                    )),
-                )
-            }
-            Err(_) => {
-                tracing::error!("Claude CLI (npx) timed out after 180 seconds");
-                (
-                    None,
-                    Some("Claude CLI timed out after 180 seconds.".to_string()),
-                )
-            }
-        }
-    } else {
-        tracing::error!("Neither claude nor npx found in PATH");
-        (None, Some("Claude CLI not found. Please install Claude Code (https://claude.ai/code) or ensure Node.js is installed.".to_string()))
-    };
-
-    // Save assistant response if we got one
-    if let Some(ref response) = response_text {
-        let _ = PmConversation::create(
-            &pool,
-            &CreatePmConversation {
-                project_id,
-                role: PmMessageRole::Assistant,
-                content: response.clone(),
-                model: Some(model.clone()),
-            },
-        )
-        .await;
     }
 
-    // Create SSE stream with the response
-    let stream = async_stream::stream! {
-        if let Some(content) = response_text {
-            let event = AiChatStreamEvent {
-                event_type: "content".to_string(),
-                content: Some(content),
-                error: None,
-            };
-            yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
-        }
+    let model_name = payload.model.clone().unwrap_or_else(|| "sonnet".to_string());
+    let user_content = payload.content.clone();
+    let pool = deployment.db().pool.clone();
+    let project_id = project.id;
+    let agent = payload.agent.unwrap_or_default();
 
-        if let Some(error) = error_text {
+    // Use CLI mode with MCP for reliable tool execution
+    tracing::info!("Using {:?} with MCP tools for PM Chat", agent);
+    create_mcp_cli_stream(agent, model_name, system_prompt, user_content, pool, project_id).await
+}
+
+/// Get available PM Chat agents
+pub async fn get_available_agents() -> Result<ResponseJson<ApiResponse<AvailablePmChatAgentsResponse>>, ApiError> {
+    let all_agents = vec![
+        PmChatAgent::ClaudeCli,
+        PmChatAgent::CodexCli,
+        PmChatAgent::GeminiCli,
+        PmChatAgent::OpencodeCli,
+    ];
+
+    let mut agents = Vec::new();
+    for agent in all_agents {
+        agents.push(PmChatAgentInfo {
+            agent,
+            display_name: agent.display_name().to_string(),
+            available: agent.is_available().await,
+            supports_streaming: agent.supports_streaming(),
+        });
+    }
+
+    Ok(ResponseJson(ApiResponse::success(AvailablePmChatAgentsResponse { agents })))
+}
+
+/// Create MCP config JSON for the specified agent
+/// Different CLIs have different MCP configuration formats
+fn create_mcp_config_for_agent(
+    agent: PmChatAgent,
+    mcp_binary_path: &Option<PathBuf>,
+    backend_url: &str,
+) -> serde_json::Value {
+    let (command, args) = if let Some(binary_path) = mcp_binary_path {
+        // Use compiled binary directly
+        tracing::info!("Using compiled MCP binary: {:?}", binary_path);
+        (binary_path.to_string_lossy().to_string(), vec![])
+    } else {
+        // Fallback: use npx to run vibe-kanban with --mcp flag
+        tracing::info!("MCP binary not found, using npx vibe-kanban --mcp");
+        ("npx".to_string(), vec!["-y".to_string(), "vibe-kanban@latest".to_string(), "--mcp".to_string()])
+    };
+
+    match agent {
+        PmChatAgent::ClaudeCli => {
+            // Claude CLI uses mcpServers format
+            json!({
+                "mcpServers": {
+                    "vibe_kanban": {
+                        "command": command,
+                        "args": args,
+                        "env": {
+                            "VIBE_BACKEND_URL": backend_url
+                        }
+                    }
+                }
+            })
+        }
+        PmChatAgent::CodexCli => {
+            // Codex CLI uses mcp_servers format
+            json!({
+                "mcp_servers": {
+                    "vibe_kanban": {
+                        "command": command,
+                        "args": args,
+                        "env": {
+                            "VIBE_BACKEND_URL": backend_url
+                        }
+                    }
+                }
+            })
+        }
+        PmChatAgent::GeminiCli => {
+            // Gemini CLI uses mcpServers format (similar to Claude)
+            json!({
+                "mcpServers": {
+                    "vibe_kanban": {
+                        "command": command,
+                        "args": args,
+                        "env": {
+                            "VIBE_BACKEND_URL": backend_url
+                        }
+                    }
+                }
+            })
+        }
+        PmChatAgent::OpencodeCli => {
+            // OpenCode CLI uses mcp format
+            json!({
+                "mcp": {
+                    "vibe_kanban": {
+                        "command": command,
+                        "args": args,
+                        "env": {
+                            "VIBE_BACKEND_URL": backend_url
+                        }
+                    }
+                },
+                "$schema": "https://opencode.ai/config.json"
+            })
+        }
+    }
+}
+
+/// Create a streaming response using the specified CLI with MCP tools for task creation and docs management
+/// This version streams CLI output line-by-line for real-time feedback
+async fn create_mcp_cli_stream(
+    agent: PmChatAgent,
+    model: String,
+    system_prompt: String,
+    user_content: String,
+    pool: sqlx::SqlitePool,
+    project_id: Uuid,
+) -> Result<Sse<SseStream>, ApiError> {
+    // Resolve the CLI path based on the agent
+    let cli_path_result = resolve_executable_path(agent.command_name()).await;
+    let npx_path_result = resolve_executable_path("npx").await;
+
+    // Get the backend URL for MCP server to connect to
+    let backend_port = env::var("BACKEND_PORT").unwrap_or_else(|_| "45557".to_string());
+    let backend_url = format!("http://localhost:{}", backend_port);
+
+    // Get path to the compiled mcp_task_server binary
+    // First try to find the binary in the target directory relative to current exe
+    let current_exe = env::current_exe().ok();
+    let mcp_binary_path = current_exe
+        .as_ref()
+        .and_then(|exe| exe.parent())
+        .map(|dir| dir.join("mcp_task_server"))
+        .filter(|p| p.exists());
+
+    // Create temporary MCP config file based on agent type
+    let mcp_config = create_mcp_config_for_agent(agent, &mcp_binary_path, &backend_url);
+
+    // Write MCP config to temp file
+    let temp_dir = env::temp_dir();
+    let config_path = temp_dir.join(format!("vibe-pm-mcp-{}.json", project_id));
+
+    if let Err(e) = fs::write(&config_path, serde_json::to_string_pretty(&mcp_config).unwrap_or_default()) {
+        tracing::error!("Failed to write MCP config: {}", e);
+        return Err(ApiError::BadRequest(format!("Failed to create MCP config: {}", e)));
+    }
+
+    tracing::info!("Created MCP config at {:?} with backend URL: {} for {:?}", config_path, backend_url, agent);
+
+    // Prepare command based on agent and available CLI
+    let (command_path, use_npx_fallback): (Option<PathBuf>, bool) = if let Some(path) = cli_path_result {
+        tracing::info!("Running {:?} from: {:?} (streaming mode)", agent, path);
+        (Some(path), false)
+    } else if agent == PmChatAgent::ClaudeCli && npx_path_result.is_some() {
+        // Only Claude CLI has npx fallback
+        tracing::info!("Running Claude CLI with MCP via npx (streaming mode)");
+        (npx_path_result, true)
+    } else {
+        // CLI not available - return error stream
+        let agent_name = agent.display_name();
+        let stream = async_stream::stream! {
             let event = AiChatStreamEvent {
                 event_type: "error".to_string(),
                 content: None,
-                error: Some(error),
+                error: Some(format!("{} not found. Please install it first.", agent_name)),
+                task_id: None,
+                task_title: None,
             };
             yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+            let done = AiChatStreamEvent { event_type: "done".to_string(), content: None, error: None, task_id: None, task_title: None };
+            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap_or_default()));
+        };
+        return Ok(Sse::new(stream.boxed()).keep_alive(KeepAlive::default()));
+    };
+
+    let Some(cmd_path) = command_path else {
+        let stream = async_stream::stream! {
+            let event = AiChatStreamEvent {
+                event_type: "error".to_string(),
+                content: None,
+                error: Some("CLI executable not found.".to_string()),
+                task_id: None,
+                task_title: None,
+            };
+            yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+            let done = AiChatStreamEvent { event_type: "done".to_string(), content: None, error: None, task_id: None, task_title: None };
+            yield Ok(Event::default().data(serde_json::to_string(&done).unwrap_or_default()));
+        };
+        return Ok(Sse::new(stream.boxed()).keep_alive(KeepAlive::default()));
+    };
+
+    // Build command based on agent type
+    let mut command = Command::new(&cmd_path);
+
+    // Add npx-specific args for Claude CLI fallback
+    if use_npx_fallback {
+        command.arg("-y").arg("@anthropic-ai/claude-code@latest");
+    }
+
+    // Add agent-specific arguments
+    match agent {
+        PmChatAgent::ClaudeCli => {
+            command
+                .arg("--print")
+                .arg("--verbose")
+                .arg("--output-format")
+                .arg("stream-json")
+                .arg("--no-session-persistence")
+                .arg("--dangerously-skip-permissions")
+                .arg("--mcp-config")
+                .arg(&config_path)
+                .arg("--model")
+                .arg(&model)
+                .arg("--system-prompt")
+                .arg(&system_prompt)
+                .arg(&user_content);
+        }
+        PmChatAgent::CodexCli => {
+            // Codex CLI uses exec subcommand with --json for streaming
+            // Note: Codex doesn't support --mcp-config flag, MCP servers must be pre-configured
+            command
+                .arg("exec")
+                .arg("--json")
+                .arg("--full-auto");
+
+            // Add model if specified (o3, o4-mini, gpt-4.1, codex-1, etc.)
+            if !model.is_empty() && model != "default" {
+                command.arg("--model").arg(&model);
+            }
+
+            command.arg(format!("{}\n\n{}", system_prompt, user_content));
+        }
+        PmChatAgent::GeminiCli => {
+            // Gemini CLI supports streaming JSON output and non-interactive mode
+            // Note: Gemini doesn't support --mcp-config flag, MCP servers must be pre-configured via `gemini mcp`
+            command
+                .arg("--output-format")
+                .arg("stream-json")
+                .arg("--yolo"); // Auto-approve all actions (non-interactive mode)
+
+            // Add model if specified (gemini-3-flash, gemini-2.5-pro, etc.)
+            if !model.is_empty() && model != "default" {
+                command.arg("--model").arg(&model);
+            }
+
+            // Gemini doesn't have --system-prompt, include in the message
+            command.arg(format!("{}\n\n{}", system_prompt, user_content));
+        }
+        PmChatAgent::OpencodeCli => {
+            // OpenCode CLI uses run subcommand with --format json
+            command
+                .arg("run")
+                .arg("--format")
+                .arg("json")
+                .arg("--model")
+                .arg(&model)
+                .arg(format!("{}\n\n{}", system_prompt, user_content));
+        }
+    }
+
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Spawn process
+    let mut child = match command.spawn() {
+        Ok(child) => child,
+        Err(e) => {
+            // Clean up config file
+            let _ = fs::remove_file(&config_path);
+            let stream = async_stream::stream! {
+                let event = AiChatStreamEvent {
+                    event_type: "error".to_string(),
+                    content: None,
+                    error: Some(format!("Failed to spawn CLI: {}", e)),
+                    task_id: None,
+                    task_title: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+                let done = AiChatStreamEvent { event_type: "done".to_string(), content: None, error: None, task_id: None, task_title: None };
+                yield Ok(Event::default().data(serde_json::to_string(&done).unwrap_or_default()));
+            };
+            return Ok(Sse::new(stream.boxed()).keep_alive(KeepAlive::default()));
+        }
+    };
+
+    // Take ownership of stdout and stderr
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+
+    // Shared state for collecting full response
+    let full_response = Arc::new(Mutex::new(String::new()));
+    let full_response_clone = full_response.clone();
+    let model_clone = model.clone();
+    let config_path_clone = config_path.clone();
+
+    // Create the streaming response
+    let stream = async_stream::stream! {
+        // Send initial "thinking" indicator
+        let thinking_event = AiChatStreamEvent {
+            event_type: "thinking".to_string(),
+            content: Some("AI is processing...".to_string()),
+            error: None,
+            task_id: None,
+            task_title: None,
+        };
+        yield Ok(Event::default().data(serde_json::to_string(&thinking_event).unwrap_or_default()));
+
+        if let Some(stdout) = stdout {
+            let reader = BufReader::new(stdout);
+            let mut lines = reader.lines();
+
+            // Stream each line as it comes
+            // Each CLI has a different JSON format:
+            // - Claude: {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+            // - Codex: {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+            // - Gemini: {"type":"message","role":"assistant","content":"...","delta":true}
+            while let Ok(Some(line)) = lines.next_line().await {
+                if line.is_empty() {
+                    continue;
+                }
+
+                // Skip non-JSON lines (like "Loading extension: ...")
+                if !line.starts_with('{') {
+                    tracing::debug!("CLI non-JSON output: {}", line);
+                    continue;
+                }
+
+                if let Ok(json_value) = serde_json::from_str::<serde_json::Value>(&line) {
+                    let event_type = json_value.get("type").and_then(|t| t.as_str());
+                    let mut extracted_text: Option<String> = None;
+
+                    match event_type {
+                        // === Claude CLI format ===
+                        // {"type":"assistant","message":{"content":[{"type":"text","text":"..."}]}}
+                        Some("assistant") => {
+                            if let Some(message) = json_value.get("message")
+                                && let Some(content_array) = message.get("content").and_then(|c| c.as_array())
+                            {
+                                for block in content_array {
+                                    if let Some(text) = block.get("text").and_then(|t| t.as_str())
+                                        && !text.is_empty()
+                                    {
+                                        extracted_text = Some(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+
+                        // === Codex CLI format ===
+                        // {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+                        // {"type":"item.completed","item":{"type":"reasoning","text":"..."}}
+                        Some("item.completed") => {
+                            if let Some(item) = json_value.get("item") {
+                                let item_type = item.get("type").and_then(|t| t.as_str());
+                                // Only extract agent_message, skip reasoning
+                                if item_type == Some("agent_message") {
+                                    if let Some(text) = item.get("text").and_then(|t| t.as_str())
+                                        && !text.is_empty()
+                                    {
+                                        extracted_text = Some(text.to_string());
+                                    }
+                                }
+                            }
+                        }
+
+                        // === Gemini CLI format ===
+                        // {"type":"message","role":"assistant","content":"...","delta":true}
+                        Some("message") => {
+                            let role = json_value.get("role").and_then(|r| r.as_str());
+                            if role == Some("assistant") {
+                                if let Some(content) = json_value.get("content").and_then(|c| c.as_str())
+                                    && !content.is_empty()
+                                {
+                                    extracted_text = Some(content.to_string());
+                                }
+                            }
+                        }
+
+                        // === Result events (Claude & Gemini) ===
+                        Some("result") => {
+                            // Claude: {"type":"result","result":"..."}
+                            if let Some(result_text) = json_value.get("result").and_then(|r| r.as_str()) {
+                                let current_response = full_response_clone.lock().await.clone();
+                                if current_response.is_empty() && !result_text.is_empty() {
+                                    extracted_text = Some(result_text.to_string());
+                                }
+                            }
+                            // Gemini result is just stats, no text content
+                        }
+
+                        // System/init events - log for debugging
+                        Some("system") | Some("init") | Some("thread.started") | Some("turn.started") | Some("turn.completed") => {
+                            tracing::debug!("CLI event: {:?}", event_type);
+                        }
+
+                        // Unknown types - log and skip
+                        _ => {
+                            tracing::debug!("CLI unknown event type: {:?}", event_type);
+                        }
+                    }
+
+                    // If we extracted text, send it as SSE event
+                    if let Some(text) = extracted_text {
+                        // Append to full response
+                        {
+                            let mut response = full_response_clone.lock().await;
+                            if !response.is_empty() && !text.starts_with(' ') {
+                                response.push(' ');
+                            }
+                            response.push_str(&text);
+                        }
+
+                        // Send as SSE event
+                        let event = AiChatStreamEvent {
+                            event_type: "content".to_string(),
+                            content: Some(text),
+                            error: None,
+                            task_id: None,
+                            task_title: None,
+                        };
+                        yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+                    }
+                } else {
+                    // If not valid JSON, treat as plain text (fallback)
+                    tracing::debug!("CLI non-JSON line: {}", line);
+                    {
+                        let mut response = full_response_clone.lock().await;
+                        if !response.is_empty() {
+                            response.push('\n');
+                        }
+                        response.push_str(&line);
+                    }
+
+                    let event = AiChatStreamEvent {
+                        event_type: "content".to_string(),
+                        content: Some(line),
+                        error: None,
+                        task_id: None,
+                        task_title: None,
+                    };
+                    yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+                }
+            }
         }
 
-        let done_event = AiChatStreamEvent {
+        // Check for stderr messages
+        if let Some(stderr) = stderr {
+            let reader = BufReader::new(stderr);
+            let mut lines = reader.lines();
+
+            while let Ok(Some(line)) = lines.next_line().await {
+                if !line.is_empty() {
+                    tracing::debug!("Claude CLI stderr: {}", line);
+                }
+            }
+        }
+
+        // Wait for the child process to complete
+        let exit_status = child.wait().await;
+
+        // Clean up temp config file
+        if let Err(e) = fs::remove_file(&config_path_clone) {
+            tracing::warn!("Failed to remove temp MCP config: {}", e);
+        }
+
+        // Get the full response and save to conversation history
+        let final_response = full_response_clone.lock().await.clone();
+        if !final_response.is_empty() {
+            let _ = PmConversation::create(
+                &pool,
+                &CreatePmConversation {
+                    project_id,
+                    role: PmMessageRole::Assistant,
+                    content: final_response,
+                    model: Some(model_clone),
+                },
+            )
+            .await;
+        }
+
+        // Check exit status for errors
+        match exit_status {
+            Ok(status) if !status.success() => {
+                let event = AiChatStreamEvent {
+                    event_type: "error".to_string(),
+                    content: None,
+                    error: Some(format!("CLI exited with status: {}", status)),
+                    task_id: None,
+                    task_title: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+            }
+            Err(e) => {
+                let event = AiChatStreamEvent {
+                    event_type: "error".to_string(),
+                    content: None,
+                    error: Some(format!("CLI error: {}", e)),
+                    task_id: None,
+                    task_title: None,
+                };
+                yield Ok(Event::default().data(serde_json::to_string(&event).unwrap_or_default()));
+            }
+            _ => {}
+        }
+
+        // Send done event
+        let done = AiChatStreamEvent {
             event_type: "done".to_string(),
             content: None,
             error: None,
+            task_id: None,
+            task_title: None,
         };
-        yield Ok(Event::default().data(serde_json::to_string(&done_event).unwrap_or_default()));
+        yield Ok(Event::default().data(serde_json::to_string(&done).unwrap_or_default()));
     };
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+    Ok(Sse::new(stream.boxed()).keep_alive(KeepAlive::default()))
 }
 
 /// Clear all PM chat messages for a project
@@ -1019,15 +1550,63 @@ pub async fn sync_task_summary_to_docs(
     Ok(ResponseJson(ApiResponse::success(updated_project)))
 }
 
+/// A workspace document from the docs/ folder
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct WorkspaceDoc {
+    pub path: String,      // Relative path from docs/ folder
+    pub repo_name: String, // Which repo this doc is from
+    pub content: String,   // Full content of the document
+}
+
+/// Response for workspace docs
+#[derive(Debug, Clone, Serialize, TS)]
+#[ts(export)]
+pub struct WorkspaceDocsResponse {
+    pub docs: Vec<WorkspaceDoc>,
+}
+
+/// Get workspace documentation files from project repos
+pub async fn get_workspace_docs(
+    Extension(project): Extension<Project>,
+    State(deployment): State<DeploymentImpl>,
+) -> Result<ResponseJson<ApiResponse<WorkspaceDocsResponse>>, ApiError> {
+    use services::services::docs_scanner::scan_docs_folder;
+
+    // Get all repos for this project
+    let repos = ProjectRepo::find_repos_for_project(&deployment.db().pool, project.id).await?;
+
+    let mut all_docs = Vec::new();
+
+    for repo in repos {
+        // Scan docs folder for this repo
+        let scanned_docs = scan_docs_folder(&repo.path).await;
+
+        for doc in scanned_docs {
+            all_docs.push(WorkspaceDoc {
+                path: doc.relative_path,
+                repo_name: repo.display_name.clone(),
+                content: doc.content,
+            });
+        }
+    }
+
+    Ok(ResponseJson(ApiResponse::success(WorkspaceDocsResponse {
+        docs: all_docs,
+    })))
+}
+
 pub fn router(_deployment: &DeploymentImpl) -> Router<DeploymentImpl> {
     Router::new()
         .route("/", get(get_pm_chat).post(send_message).delete(clear_chat))
         .route("/ai-chat", post(ai_chat))
+        .route("/ai-agents", get(get_available_agents))
         .route("/messages/{message_id}", delete(delete_message))
         .route("/attachments", get(get_attachments).post(upload_attachment))
         .route("/attachments/{attachment_id}", delete(delete_attachment))
         .route("/attachments/{attachment_id}/file", get(serve_attachment))
         .route("/docs", get(get_pm_docs).put(update_pm_docs))
+        .route("/workspace-docs", get(get_workspace_docs))
         .route(
             "/task-summary",
             get(get_task_summary).post(sync_task_summary_to_docs),
