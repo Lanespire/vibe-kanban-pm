@@ -1,4 +1,5 @@
 use std::{env, fs, path::PathBuf, process::Stdio, sync::Arc};
+use utils::port_file::read_port_file;
 
 use axum::{
     Extension, Json, Router,
@@ -540,7 +541,14 @@ async fn create_mcp_cli_stream(
     let npx_path_result = resolve_executable_path("npx").await;
 
     // Get the backend URL for MCP server to connect to
-    let backend_port = env::var("BACKEND_PORT").unwrap_or_else(|_| "45557".to_string());
+    // Priority: BACKEND_PORT env var > port file > fallback to 45557
+    let backend_port = if let Ok(port) = env::var("BACKEND_PORT") {
+        port
+    } else if let Ok(port) = read_port_file("vibe-kanban").await {
+        port.to_string()
+    } else {
+        "45557".to_string()
+    };
     let backend_url = format!("http://localhost:{}", backend_port);
 
     // Get path to the compiled mcp_task_server binary
