@@ -1,0 +1,62 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT id as \"id!: Uuid\",\n                      task_id as \"task_id!: Uuid\",\n                      file_name as \"file_name!\",\n                      file_path as \"file_path!\",\n                      mime_type as \"mime_type!\",\n                      file_size as \"file_size!\",\n                      sha256,\n                      created_at as \"created_at!: DateTime<Utc>\"\n               FROM task_attachments\n               WHERE task_id = $1\n               ORDER BY created_at",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: Uuid",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "task_id!: Uuid",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "file_name!",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "file_path!",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "mime_type!",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "file_size!",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "sha256",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "created_at!: DateTime<Utc>",
+        "ordinal": 7,
+        "type_info": "Datetime"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "ef2b26e77b2ac22c3e7452b5de0a658383bb39a02601736bb6b607262a8e679f"
+}

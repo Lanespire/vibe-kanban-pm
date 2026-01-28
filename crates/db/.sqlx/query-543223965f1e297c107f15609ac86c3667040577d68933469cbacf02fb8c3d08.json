@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM task_attachments WHERE task_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "543223965f1e297c107f15609ac86c3667040577d68933469cbacf02fb8c3d08"
+}
