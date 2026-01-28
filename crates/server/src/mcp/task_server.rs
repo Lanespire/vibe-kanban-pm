@@ -399,6 +399,67 @@ pub struct GetTaskResponse {
     pub task: TaskDetails,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListTaskAttachmentsRequest {
+    #[schemars(description = "The ID of the task to list attachments for")]
+    pub task_id: Uuid,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct TaskAttachmentInfo {
+    #[schemars(description = "The unique identifier of the attachment")]
+    pub id: String,
+    #[schemars(description = "The original file name")]
+    pub file_name: String,
+    #[schemars(description = "The MIME type of the file")]
+    pub mime_type: String,
+    #[schemars(description = "The file size in bytes")]
+    pub file_size: i64,
+    #[schemars(description = "URL to download the file")]
+    pub download_url: String,
+    #[schemars(description = "When the file was attached")]
+    pub created_at: String,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct ListTaskAttachmentsResponse {
+    pub task_id: String,
+    pub attachments: Vec<TaskAttachmentInfo>,
+    pub count: usize,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AttachFileToTaskRequest {
+    #[schemars(description = "The ID of the task to attach the file to")]
+    pub task_id: Uuid,
+    #[schemars(description = "The absolute path to the file to attach")]
+    pub file_path: String,
+    #[schemars(description = "Optional custom file name. If not provided, uses the original file name.")]
+    pub file_name: Option<String>,
+}
+
+#[derive(Debug, Serialize, schemars::JsonSchema)]
+pub struct AttachFileToTaskResponse {
+    #[schemars(description = "The ID of the created attachment")]
+    pub attachment_id: String,
+    #[schemars(description = "The task ID")]
+    pub task_id: String,
+    #[schemars(description = "The file name")]
+    pub file_name: String,
+    #[schemars(description = "The file size in bytes")]
+    pub file_size: i64,
+    #[schemars(description = "URL to download the file")]
+    pub download_url: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DeleteTaskAttachmentRequest {
+    #[schemars(description = "The ID of the task")]
+    pub task_id: Uuid,
+    #[schemars(description = "The ID of the attachment to delete")]
+    pub attachment_id: Uuid,
+}
+
 #[derive(Debug, Clone)]
 pub struct TaskServer {
     client: reqwest::Client,
@@ -1142,24 +1203,21 @@ impl TaskServer {
     ) -> Result<CallToolResult, ErrorData> {
         if repos.is_empty() {
             return Self::err(
-                "At least one repository must be specified.".to_string(),
-                None::<String>,
+                "At least one repository must be specified.",
+                None::<&str>,
             );
         }
 
         let executor_trimmed = executor.trim();
         if executor_trimmed.is_empty() {
-            return Self::err("Executor must not be empty.".to_string(), None::<String>);
+            return Self::err("Executor must not be empty.", None::<&str>);
         }
 
         let normalized_executor = executor_trimmed.replace('-', "_").to_ascii_uppercase();
         let base_executor = match BaseCodingAgent::from_str(&normalized_executor) {
             Ok(exec) => exec,
             Err(_) => {
-                return Self::err(
-                    format!("Unknown executor '{executor_trimmed}'."),
-                    None::<String>,
-                );
+                return Self::err(format!("Unknown executor '{executor_trimmed}'."), None);
             }
         };
 
@@ -1463,6 +1521,184 @@ impl TaskServer {
     }
 
     #[tool(
+        description = "List all file attachments for a task. Returns file names, sizes, MIME types, and download URLs."
+    )]
+    async fn list_task_attachments(
+        &self,
+        Parameters(ListTaskAttachmentsRequest { task_id }): Parameters<ListTaskAttachmentsRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.url(&format!("/api/tasks/{}/attachments", task_id));
+
+        #[derive(Deserialize)]
+        struct AttachmentResponse {
+            id: Uuid,
+            file_name: String,
+            mime_type: String,
+            file_size: i64,
+            download_url: String,
+            created_at: String,
+        }
+
+        let attachments: Vec<AttachmentResponse> = match self.send_json(self.client.get(&url)).await {
+            Ok(a) => a,
+            Err(e) => return Ok(e),
+        };
+
+        let attachment_infos: Vec<TaskAttachmentInfo> = attachments
+            .into_iter()
+            .map(|a| TaskAttachmentInfo {
+                id: a.id.to_string(),
+                file_name: a.file_name,
+                mime_type: a.mime_type,
+                file_size: a.file_size,
+                download_url: a.download_url,
+                created_at: a.created_at,
+            })
+            .collect();
+
+        let count = attachment_infos.len();
+        TaskServer::success(&ListTaskAttachmentsResponse {
+            task_id: task_id.to_string(),
+            attachments: attachment_infos,
+            count,
+        })
+    }
+
+    #[tool(
+        description = "Attach a file from a local path to a task. The file will be uploaded and stored. Use this to attach reference documents, design files, screenshots, etc. to a task."
+    )]
+    async fn attach_file_to_task(
+        &self,
+        Parameters(AttachFileToTaskRequest { task_id, file_path, file_name }): Parameters<AttachFileToTaskRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        use std::path::Path;
+
+        // Read the file
+        let path = Path::new(&file_path);
+        if !path.exists() {
+            return Self::err("File not found", Some(&file_path));
+        }
+
+        let file_data = match tokio::fs::read(&path).await {
+            Ok(data) => data,
+            Err(e) => return Self::err("Failed to read file", Some(&e.to_string())),
+        };
+
+        let actual_file_name = file_name.unwrap_or_else(|| {
+            path.file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("attachment")
+                .to_string()
+        });
+
+        // Guess MIME type from extension
+        let mime_type = match path.extension().and_then(|e| e.to_str()) {
+            Some("pdf") => "application/pdf",
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("svg") => "image/svg+xml",
+            Some("txt") => "text/plain",
+            Some("md") => "text/markdown",
+            Some("json") => "application/json",
+            Some("xml") => "application/xml",
+            Some("html") => "text/html",
+            Some("css") => "text/css",
+            Some("js") => "application/javascript",
+            Some("ts") => "application/typescript",
+            Some("zip") => "application/zip",
+            Some("tar") => "application/x-tar",
+            Some("gz") => "application/gzip",
+            _ => "application/octet-stream",
+        };
+
+        // Create multipart form - mime_str should never fail for these standard MIME types
+        let part = reqwest::multipart::Part::bytes(file_data)
+            .file_name(actual_file_name.clone())
+            .mime_str(mime_type)
+            .expect("Invalid MIME type");
+        let form = reqwest::multipart::Form::new().part("file", part);
+
+        let url = self.url(&format!("/api/tasks/{}/attachments", task_id));
+
+        let response = match self.client
+            .post(&url)
+            .multipart(form)
+            .send()
+            .await
+        {
+            Ok(resp) => resp,
+            Err(e) => return Self::err("Failed to upload file", Some(&e.to_string())),
+        };
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Ok(CallToolResult::error(vec![Content::text(format!(
+                "Failed to attach file: {} - {}",
+                status, body
+            ))]));
+        }
+
+        #[derive(Deserialize)]
+        struct UploadResponse {
+            success: bool,
+            data: Option<AttachmentData>,
+        }
+
+        #[derive(Deserialize)]
+        struct AttachmentData {
+            id: Uuid,
+            task_id: Uuid,
+            file_name: String,
+            file_size: i64,
+            download_url: String,
+        }
+
+        let upload_response: UploadResponse = match response.json().await {
+            Ok(resp) => resp,
+            Err(e) => return Self::err("Failed to parse upload response", Some(&e.to_string())),
+        };
+
+        if !upload_response.success {
+            return Self::err("Upload failed", None::<&str>);
+        }
+
+        let data = match upload_response.data {
+            Some(d) => d,
+            None => return Self::err("Upload response missing data", None::<&str>),
+        };
+
+        TaskServer::success(&AttachFileToTaskResponse {
+            attachment_id: data.id.to_string(),
+            task_id: data.task_id.to_string(),
+            file_name: data.file_name,
+            file_size: data.file_size,
+            download_url: data.download_url,
+        })
+    }
+
+    #[tool(
+        description = "Delete a file attachment from a task."
+    )]
+    async fn delete_task_attachment(
+        &self,
+        Parameters(DeleteTaskAttachmentRequest { task_id, attachment_id }): Parameters<DeleteTaskAttachmentRequest>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let url = self.url(&format!("/api/tasks/{}/attachments/{}", task_id, attachment_id));
+
+        if let Err(e) = self.send_empty_json(self.client.delete(&url)).await {
+            return Ok(e);
+        }
+
+        TaskServer::success(&serde_json::json!({
+            "success": true,
+            "deleted_attachment_id": attachment_id.to_string(),
+            "task_id": task_id.to_string(),
+        }))
+    }
+
+    #[tool(
         description = "Update the PM (Project Manager) documentation for a project. Use this to save specifications, requirements, architecture notes, or any project documentation. The PM docs are stored as markdown and can be viewed in the PM Docs panel."
     )]
     async fn update_pm_docs(
@@ -1532,7 +1768,7 @@ impl TaskServer {
 #[tool_handler]
 impl ServerHandler for TaskServer {
     fn get_info(&self) -> ServerInfo {
-        let mut instruction = "A task and project management server with PM (Project Manager) capabilities. TOOLS: 'list_projects', 'list_tasks', 'create_task', 'get_project_progress', 'start_workspace_session', 'get_task', 'update_task', 'delete_task', 'list_repos', 'get_repo', 'update_setup_script', 'update_cleanup_script', 'update_dev_server_script', 'get_pm_context', 'request_pm_review', 'update_pm_docs'. PM FEATURES: Use 'create_task' with check_duplicate=true to avoid creating duplicate tasks. Use 'create_task' with depends_on=[task_ids] to set task dependencies. Use 'get_project_progress' to get completion percentage and task status summary. Use 'get_pm_context' to fetch project specifications before implementing. Use 'request_pm_review' for review checklists. Use 'update_pm_docs' to save structured documentation. Always pass project_id where required.".to_string();
+        let mut instruction = "A task and project management server with PM (Project Manager) capabilities. TOOLS: 'list_projects', 'list_tasks', 'create_task', 'get_project_progress', 'start_workspace_session', 'get_task', 'update_task', 'delete_task', 'list_repos', 'get_repo', 'update_setup_script', 'update_cleanup_script', 'update_dev_server_script', 'get_pm_context', 'request_pm_review', 'update_pm_docs', 'list_task_attachments', 'attach_file_to_task', 'delete_task_attachment'. PM FEATURES: Use 'create_task' with check_duplicate=true to avoid creating duplicate tasks. Use 'create_task' with depends_on=[task_ids] to set task dependencies. Use 'get_project_progress' to get completion percentage and task status summary. Use 'get_pm_context' to fetch project specifications before implementing. Use 'request_pm_review' for review checklists. Use 'update_pm_docs' to save structured documentation. ATTACHMENTS: Use 'attach_file_to_task' to attach reference documents, design files, or screenshots to a task. Use 'list_task_attachments' to see all attached files. Always pass project_id where required.".to_string();
         if self.context.is_some() {
             let context_instruction = "Use 'get_context' to fetch project/task/workspace metadata (including PM context if available) for the active Vibe Kanban workspace session when available.";
             instruction = format!("{} {}", context_instruction, instruction);
